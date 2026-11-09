@@ -3,7 +3,7 @@ FILES = {'src/main/java/ua/widedoors/WideDoorBlock.java': 'package ua.widedoors;
 for _p, _t in FILES.items():
     os.makedirs(os.path.dirname(_p), exist_ok=True)
     open(_p, 'w', encoding='utf-8').write(_t)
-import json, os, random
+import json, os, random, io, zipfile, urllib.request
 from PIL import Image, ImageDraw
 
 R = "src/main/resources"
@@ -14,6 +14,68 @@ def w(path, obj):
     os.makedirs(os.path.dirname(path), exist_ok=True)
     with open(path, "w", encoding="utf-8") as f:
         json.dump(obj, f, indent=1, ensure_ascii=False)
+
+
+# ---------- колір ручки беремо з оригінальних дверей гри (завантажуємо клієнт Minecraft з серверів Mojang) ----------
+DEFAULT_HANDLE = (112, 114, 120)
+
+def fetch_client_zip():
+    try:
+        mf = json.load(urllib.request.urlopen("https://piston-meta.mojang.com/mc/game/version_manifest_v2.json", timeout=30))
+        v = next(x for x in mf["versions"] if x["id"] == "1.21.11")
+        vj = json.load(urllib.request.urlopen(v["url"], timeout=30))
+        data = urllib.request.urlopen(vj["downloads"]["client"]["url"], timeout=300).read()
+        return zipfile.ZipFile(io.BytesIO(data))
+    except Exception as e:
+        print("WARNING: could not download Minecraft client:", e)
+        return None
+
+def _dist(a, b):
+    return sum((a[i] - b[i]) ** 2 for i in range(3)) ** 0.5
+
+def find_knob(img):
+    """Шукає на текстурі дверей невеликий (2-9 пікселів) кластер, що найбільше відрізняється від дерева."""
+    px = img.load(); W, H = img.size
+    op = [(x, y, px[x, y][:3]) for y in range(H) for x in range(W) if px[x, y][3] > 200]
+    if len(op) < 20:
+        return None
+    med = tuple(sorted(c[i] for _, _, c in op)[len(op) // 2] for i in range(3))
+    seen = set()
+    for x, y, c in sorted(op, key=lambda t: -_dist(t[2], med)):
+        if (x, y) in seen:
+            continue
+        seen.add((x, y))
+        if not (x >= W // 2 and 1 <= x <= W - 2 and 1 <= y <= H - 2):
+            continue
+        stack, cl = [(x, y)], []
+        while stack:
+            cx, cy = stack.pop(); cl.append((cx, cy))
+            for nx, ny in ((cx+1, cy), (cx-1, cy), (cx, cy+1), (cx, cy-1)):
+                if 0 <= nx < W and 0 <= ny < H and (nx, ny) not in seen and px[nx, ny][3] > 200 \
+                        and _dist(px[nx, ny][:3], c) < 30:
+                    seen.add((nx, ny)); stack.append((nx, ny))
+        if 2 <= len(cl) <= 9:
+            avg = tuple(sum(px[a, b][i] for a, b in cl) // len(cl) for i in range(3))
+            return avg, _dist(c, med)
+    return None
+
+def handle_color(zf, wid):
+    if zf is None:
+        return DEFAULT_HANDLE
+    best = None
+    for part in ("bottom", "top"):
+        try:
+            im = Image.open(io.BytesIO(zf.read(f"assets/minecraft/textures/block/{wid}_door_{part}.png"))).convert("RGBA")
+            r = find_knob(im)
+            if r and (best is None or r[1] > best[1]):
+                best = r
+        except Exception as e:
+            print("WARNING: knob search failed for", wid, part, e)
+    print("handle color", wid, best[0] if best else "default")
+    return best[0] if best else DEFAULT_HANDLE
+
+CLIENT_ZIP = fetch_client_zip()
+HANDLE_COL = {}
 
 # id, укр. назва, англ. назва, текстура кори, приблизний колір (тільки для іконок)
 WOODS = [
@@ -52,6 +114,7 @@ def leaf_rects(style):
         r += [("bar", 11, 13, y1, y2) for (y1, y2) in rows2]
         panes = [(a, b, y1, y2) for (y1, y2) in rows2 for (a, b) in cols2]
     r += [("glass",) + p for p in panes]
+    r.append(("handle", 17, 19, 20, 28))
     return r
 
 def uv_funcs(rect):
@@ -64,7 +127,7 @@ def uv_funcs(rect):
         return (lambda s: (s-s1)/(s2-s1)*16), (lambda y: (y2-y)/(y2-y1)*16)
     return None, None
 
-TEX = {"frame": "#frame", "bar": "#bar", "glass": "#glass", "dbot": "#dbot", "dtop": "#dtop"}
+TEX = {"handle": "#handle", "frame": "#frame", "bar": "#bar", "glass": "#glass", "dbot": "#dbot", "dtop": "#dtop"}
 EXPLICIT = ("glass", "dbot", "dtop")
 
 def r4(v): return round(v, 4)
@@ -72,12 +135,13 @@ def r4(v): return round(v, 4)
 def closed_depth(kind):
     if kind in ("frame", "dbot", "dtop"): return 13, 16
     if kind == "bar": return 14, 15
+    if kind == "handle": return 12, 16
     return 14.5, 15.5
 
 def open_depth(kind, side):
     if side == "left":
-        return {"frame": (0, 3), "dbot": (0, 3), "dtop": (0, 3), "bar": (1, 2), "glass": (1.25, 1.75)}[kind]
-    return {"frame": (13, 16), "dbot": (13, 16), "dtop": (13, 16), "bar": (14, 15), "glass": (14.25, 14.75)}[kind]
+        return {"frame": (0, 3), "dbot": (0, 3), "dtop": (0, 3), "bar": (1, 2), "glass": (1.25, 1.75), "handle": (0, 3)}[kind]
+    return {"frame": (13, 16), "dbot": (13, 16), "dtop": (13, 16), "bar": (14, 15), "glass": (14.25, 14.75), "handle": (13, 16)}[kind]
 
 def closed_elements(c, r, style):
     els = []
@@ -164,7 +228,7 @@ def write_item(name, layer0):
     w(f"{A}/items/{name}.json", {"model": {"type": "minecraft:model", "model": f"widedoors:item/{name}"}})
     w(f"{A}/models/item/{name}.json", {"parent": "minecraft:item/generated", "textures": {"layer0": layer0}})
 
-def make_icon(path, color, style):
+def make_icon(path, color, style, hcol=(120, 122, 128)):
     rnd = random.Random(1)
     img = Image.new("RGBA", (48, 48), (0, 0, 0, 0)); px = img.load()
     for leaf in ("L", "R"):
@@ -174,6 +238,7 @@ def make_icon(path, color, style):
                 for Y in range(y1, y2):
                     yy = 47 - Y
                     if kind == "glass": px[X, yy] = (200, 230, 240, 120)
+                    elif kind == "handle": px[X, yy] = tuple(hcol) + (255,)
                     else:
                         v = tuple(max(0, min(255, k + rnd.randint(-8, 8))) for k in color)
                         if kind == "bar": v = tuple(min(255, k + 12) for k in v)
@@ -191,9 +256,15 @@ en, uk = {}, {}
 axe, pick = [], []
 
 for wid, ukn, enn, log, col in WOODS:
+    hc = handle_color(CLIENT_ZIP, wid)
+    HANDLE_COL[wid] = hc
+    os.makedirs(f"{A}/textures/block", exist_ok=True)
+    himg = Image.new("RGBA", (16, 16), tuple(hc) + (255,))
+    himg.putpixel((0, 0), tuple(min(255, k + 25) for k in hc) + (255,))
+    himg.save(f"{A}/textures/block/handle_{wid}.png")
     planks = f"minecraft:block/{wid}_planks"
     base_tex = {"particle": planks, "frame": f"minecraft:block/{log}", "bar": planks,
-                "glass": "minecraft:block/glass",
+                "glass": "minecraft:block/glass", "handle": f"widedoors:block/handle_{wid}",
                 "dtop": f"minecraft:block/{wid}_door_top", "dbot": f"minecraft:block/{wid}_door_bottom"}
     # суцільні двері
     name = f"wide_{wid}_door"
@@ -210,7 +281,7 @@ for wid, ukn, enn, log, col in WOODS:
     for sid, sukn, sen in STYLES:
         gname = f"wide_{wid}_glass_door_{sid}"
         write_door(gname, sid, base_tex)
-        make_icon(f"{A}/textures/item/{gname}.png", col, sid)
+        make_icon(f"{A}/textures/item/{gname}.png", col, sid, hc)
         write_item(gname, f"widedoors:item/{gname}")
         en[f"block.widedoors.{gname}"] = f"Wide {enn} Glass Door ({sen})"
         uk[f"block.widedoors.{gname}"] = f"Широкі скляні двері ({ukn}, {sukn})"
